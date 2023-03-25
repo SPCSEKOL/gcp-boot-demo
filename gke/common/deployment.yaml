@@ -1,0 +1,89 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gcp-boot-demo--svc
+  labels:
+    app: gcp-boot-demo-app
+    ref: gcp-boot-demo-app
+    team: home
+spec:
+  selector:
+    app: gcp-boot-demo-pod
+  type: LoadBalancer
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 9090
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gcp-boot-demo--deployment
+  labels:
+    app: gcp-boot-demo-app
+    team: home
+spec:
+  replicas: $REPLICA_COUNT
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: gcp-boot-demo-pod
+  template:
+    metadata:
+      labels:
+        app: gcp-boot-demo-pod
+        team: home
+        stage: $STAGE
+    spec:
+      securityContext:
+        runAsUser: 10101
+        runAsGroup: 10101
+        fsGroup: 10101
+      containers:
+        - image: gcr.io/$GKE_PROJECT_ID/$GCR_REPO_NAME_APP:$IMAGE_TAG
+          name: gcp-boot-demo-app
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 9090
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 300m
+              memory: 450Mi
+            requests:
+              cpu: 100m
+              memory: 150Mi
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 9090
+            periodSeconds: 15
+            initialDelaySeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            periodSeconds: 5
+            successThreshold: 1
+            httpGet:
+              path: /actuator/health
+              port: 9090
+      terminationGracePeriodSeconds: 60
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - gcp-boot-demo-app
+                topologyKey: topology.kubernetes.io/zone

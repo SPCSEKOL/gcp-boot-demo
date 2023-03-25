@@ -1,0 +1,152 @@
+name: Build and Deployment Pipeline of gcp-boot-demo in Google Kubernetes Engine
+
+on:
+  pull_request:
+    types: [ closed ]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - 'docs/'
+
+env:
+  JAVA_VERSION: 18
+  IMAGE_TAG: sha-${{ github.event.pull_request.head.sha }}
+  TZ: 'Asia/Kolkata'
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+  GKE_PROJECT_ID: ${{ secrets.GKE_PROJECT_ID }}
+  GCR_REPO_NAME_APP: 'spcsekol/gcp-boot-demo'
+  GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+  GKE_SERVICE_ACCOUNT_ID: ${{ secrets.GKE_SERVICE_ACCOUNT_ID }}
+
+jobs:
+
+  build-app:
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    if: ${{ github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'build:run') }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup JDK version ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v3
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Verify Java version
+        run: java -version
+
+      - name: Build project with Maven
+        run: mvn -e clean install
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v1
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GKE_SERVICE_ACCOUNT_ID }}
+          token_format: access_token
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: gcr.io
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Define image metadata
+        id: docker_meta
+        uses: docker/metadata-action@v4
+        with:
+          images: gcr.io/${{ env.GKE_PROJECT_ID }}/${{ env.GCR_REPO_NAME_APP }}
+          tags: |
+            type=raw,value=${{ env.IMAGE_TAG }}
+            type=raw,value=pr-build-${{ github.event.pull_request.number }}-latest
+          labels: |
+            org.opencontainers.image.authors=Sudeepta
+            org.opencontainers.image.vendor=Home
+
+      - name: Build image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile
+          no-cache: true
+          push:  true
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
+
+  deploy-app-to-gke:
+
+    name: Deploy app to Google Kubernetes Engine
+    needs: build-app
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    if: ${{ github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'deploy:gke') }}
+
+    env:
+      ENVIRONMENT: test
+      GKE_DEPLOYMENT_APP: gcp-boot-demo--deployment
+      NAMESPACE: gcp-boot-demo-pr-${{ github.event.pull_request.number }}
+      IMAGE_TAG: sha-${{ github.event.pull_request.head.sha }}
+      NETWORK_VISIBILITY: external
+      REPLICA_COUNT: 1
+      GKE_CLUSTER: ${{ secrets.GKE_CLUSTER }}
+      GKE_ZONE: ${{ secrets.GKE_ZONE }}
+      GKE_PROJECT_ID: ${{ secrets.GKE_PROJECT_ID }}
+      GKE_SERVICE_ACCOUNT_ID: ${{ secrets.GKE_SERVICE_ACCOUNT_ID }}
+      GCR_REPO_NAME_APP: 'spcsekol/gcp-boot-demo'
+      STAGE: uat
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Authenticate to Google Cloud for GKE
+        id: auth-gke
+        uses: google-github-actions/auth@v1
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GKE_SERVICE_ACCOUNT_ID }}
+
+      - name: Setup gcloud for GKE functions
+        uses: google-github-actions/setup-gcloud@v1
+
+      - name: Install kubectl authentication plugin
+        run: gcloud components install gke-gcloud-auth-plugin
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v1
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GKE_ZONE }}
+
+      - name: Ensure namespace is created
+        run: envsubst < gke/${ENVIRONMENT}/namespace-pr.yaml | kubectl apply -f -
+
+      - name: Creating serviceaccount, role and rolebinding
+        run: envsubst < gke/${ENVIRONMENT}/service_account.yaml | kubectl apply -f -
+
+      - name: Deploy to Google Kubernetes Engine
+        run: envsubst < gke/common/deployment.yaml | kubectl apply -n ${NAMESPACE} -f -
+
+      - name: Wait until deploy is successfully finished
+        timeout-minutes: 10
+        run: kubectl rollout status deployment/${GKE_DEPLOYMENT_APP} --namespace=${NAMESPACE} --timeout=600s
