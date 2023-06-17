@@ -1,0 +1,131 @@
+name: Build and Deployment Pipeline of gcp-boot-demo in Cloud Run
+
+on:
+  pull_request:
+    types: [ opened, synchronize,reopened,ready_for_review ]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - 'docs/'
+
+env:
+  JAVA_VERSION: 18
+  IMAGE_TAG: sha-${{ github.event.pull_request.head.sha }}
+  TZ: 'Asia/Kolkata'
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+  GKE_PROJECT_ID: 'supple-rex-390110'
+  GCR_REPO_NAME_APP: 'spcsekol/gcp-boot-demo'
+  GCP_WORKLOAD_IDENTITY_PROVIDER: 'projects/1065797170067/locations/global/workloadIdentityPools/sp-pool-1/providers/sp-provider'
+  GKE_SERVICE_ACCOUNT_ID: 'duplex-engine@supple-rex-390110.iam.gserviceaccount.com'
+
+jobs:
+
+  build-app:
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    if: ${{ github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'build:run') }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup JDK version ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v3
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Verify Java version
+        run: java -version
+
+      - name: Build project with Maven
+        run: mvn -e clean install
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v1
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GKE_SERVICE_ACCOUNT_ID }}
+          token_format: access_token
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: gcr.io
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Define image metadata
+        id: docker_meta
+        uses: docker/metadata-action@v4
+        with:
+          images: gcr.io/${{ env.GKE_PROJECT_ID }}/${{ env.GCR_REPO_NAME_APP }}
+          tags: |
+            type=raw,value=${{ env.IMAGE_TAG }}
+            type=raw,value=pr-build-${{ github.event.pull_request.number }}-latest
+          labels: |
+            org.opencontainers.image.authors=Sudeepta
+            org.opencontainers.image.vendor=Home
+
+      - name: Build image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile
+          no-cache: true
+          push:  true
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
+
+  deploy-app-to-gke:
+
+    name: Deploy app to Google Cloud Run
+    needs: build-app
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    if: ${{ github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'deploy:gke') }}
+
+    env:
+      IMAGE_TAG: sha-${{ github.event.pull_request.head.sha }}
+      GKE_PROJECT_ID: 'supple-rex-390110'
+      GKE_SERVICE_ACCOUNT_ID: 'duplex-engine@supple-rex-390110.iam.gserviceaccount.com'
+      GCR_REPO_NAME_APP: 'spcsekol/gcp-boot-demo'
+      GCP_WORKLOAD_IDENTITY_PROVIDER: 'projects/1065797170067/locations/global/workloadIdentityPools/sp-pool-1/providers/sp-provider'
+      CLOUD_RUN_SERVICE: cloud-run-demo
+      CLOUD_RUN_REGION: us-central1
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Authenticate to Google Cloud for Cloud Run
+        id: auth-gke
+        uses: google-github-actions/auth@v1
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GKE_SERVICE_ACCOUNT_ID }}
+
+      - name: Setup gcloud for Cloud Run
+        uses: google-github-actions/setup-gcloud@v1
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        run: gcloud run deploy $CLOUD_RUN_SERVICE --image gcr.io/$GKE_PROJECT_ID/$GCR_REPO_NAME_APP:$IMAGE_TAG --region $CLOUD_RUN_REGION --port 9090 --allow-unauthenticated --platform managed
+
+      - name: Show Output
+        run: echo ${{ steps.deploy.outputs.url }}
